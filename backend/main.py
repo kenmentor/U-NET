@@ -1,14 +1,17 @@
+import os
+import sys
+import io
+import base64
+import urllib.request
+from PIL import Image
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import JSONResponse
+
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
-from PIL import Image
-import io
-import os
-import sys
-import base64
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -27,18 +30,42 @@ app.add_middleware(
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = None
 
+# Hugging Face Direct Download URL for your uploaded model
+MODEL_URL = "https://huggingface.co/mentorcode/u-net/resolve/main/unet_checkpoint.pth"
+
+def download_checkpoint_if_missing(checkpoint_path: str):
+    if not os.path.exists(checkpoint_path):
+        print(f"Checkpoint not found at {checkpoint_path}. Downloading from Hugging Face...")
+        try:
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+            
+            # Download file from Hugging Face
+            urllib.request.urlretrieve(MODEL_URL, checkpoint_path)
+            print("Download completed successfully!")
+        except Exception as e:
+            print(f"Error downloading checkpoint: {e}")
+            raise RuntimeError(f"Failed to download model weights: {e}")
+
 def load_model():
     global model
     if model is None:
-        model = UNET(in_channels=3, out_channel=1).to(device)
         checkpoint_path = os.path.join(os.path.dirname(__file__), "unet_checkpoint.pth")
-        if os.path.exists(checkpoint_path):
+        
+        # Download weights dynamically if missing
+        download_checkpoint_if_missing(checkpoint_path)
+        
+        model = UNET(in_channels=3, out_channel=1).to(device)
+        
+        # Disable autograd globally during weight loading to save memory
+        with torch.inference_mode():
             checkpoint = torch.load(checkpoint_path, map_location=device)
             if "model_state_dict" in checkpoint:
                 model.load_state_dict(checkpoint["model_state_dict"])
             else:
                 model.load_state_dict(checkpoint)
-        model.eval()
+            model.eval()
+            
     return model
 
 transform = transforms.Compose([
@@ -73,9 +100,10 @@ async def segment_image(file: UploadFile = File(...)):
 
         input_tensor = transform(image).unsqueeze(0).to(device)
 
-        model = load_model()
-        with torch.no_grad():
-            output = model(input_tensor)
+        model_instance = load_model()
+        
+        with torch.inference_mode():
+            output = model_instance(input_tensor)
             output = torch.sigmoid(output)
             mask_prob = output.squeeze().cpu()
             output = (output > 0.5).float()
@@ -87,7 +115,7 @@ async def segment_image(file: UploadFile = File(...)):
         mask_image = Image.fromarray((mask * 255).astype("uint8"), mode="L")
         mask_resized = mask_image.resize(original_size, Image.Resampling.LANCZOS)
 
-        # Probability mask (for visualization)
+        # Probability mask
         prob_mask = F.interpolate(mask_prob.unsqueeze(0).unsqueeze(0), size=original_size[::-1], mode="bilinear", align_corners=False)
         prob_np = prob_mask.squeeze().cpu().numpy()
         prob_image = Image.fromarray((prob_np * 255).astype("uint8"), mode="L")
@@ -99,7 +127,7 @@ async def segment_image(file: UploadFile = File(...)):
         original_rgba = image.convert("RGBA")
         segmented = Image.alpha_composite(original_rgba, mask_rgba)
 
-        # Colorized mask overlay (teal for segmented regions)
+        # Colorized mask overlay
         color_overlay = Image.new("RGBA", original_size, (13, 148, 136, 0))
         color_overlay.putalpha(mask_resized)
         composed_preview = Image.alpha_composite(original_rgba, color_overlay)
@@ -118,4 +146,3 @@ async def segment_image(file: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-    print("hello world")
